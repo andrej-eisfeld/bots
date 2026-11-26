@@ -1,0 +1,701 @@
+//+------------------------------------------------------------------+
+//|                                        QuarterlyTheoryCRT_EA.mq5  |
+//|              Quarterly Theory CRT Expert Advisor - MT5           |
+//|                                                                  |
+//|  Ported from the "Quarterly Theory CRT" Pine Script indicator.  |
+//|                                                                  |
+//|  Logic (per 6-hour session block, evaluated on closed bars):    |
+//|    Sessions (target timezone):                                  |
+//|      Asian   00:00-06:00                                         |
+//|      London  06:00-12:00                                         |
+//|      New York 12:00-18:00                                        |
+//|      Fourth  18:00-00:00                                         |
+//|                                                                  |
+//|    1. Track previous session High / Low as reference levels.    |
+//|    2. Bearish: sweep previous session High, then a candle       |
+//|       closes below the sweep candle's low  -> SELL (market/limits)|
+//|    3. Bullish: sweep previous session Low, then a candle        |
+//|       closes above the sweep candle's high -> BUY (market/limits)|
+//|       Limits at 0.618 / 0.705 / 0.786 of session extreme ->      |
+//|       confirmation candle range; unfilled limits are cancelled  |
+//|       at the next session roll-over.                             |
+//|    4. SL beyond the current session extreme (+ buffer).         |
+//|    5. TP at InpTakeProfitRR * risk from each entry price.       |
+//|                                                                  |
+//|  Designed for the M15 timeframe. Fixed risk of InpRiskPercent   |
+//|  of account balance per trade.                                   |
+//+------------------------------------------------------------------+
+#property copyright   "Quarterly Theory CRT EA"
+#property version     "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//--- Input Parameters
+input group "=== Risk Management ==="
+input double   InpRiskPercent     = 0.1;   // Risk % of balance per trade
+input double   InpSLBufferPoints  = 0;     // Extra SL buffer beyond session extreme (points)
+input double   InpTakeProfitRR    = 1.0;   // Take profit as R multiple of SL distance
+
+input group "=== Session Settings ==="
+input int      InpSessionGMTOffset = 0;    // Hours to add to broker time = target session time
+input bool     InpTradeAsian       = true; // Trade Asian session   (00:00-06:00)
+input bool     InpTradeLondon      = true; // Trade London session  (06:00-12:00)
+input bool     InpTradeNewYork     = true; // Trade New York session (12:00-18:00)
+input bool     InpTradeFourth      = true; // Trade Fourth session  (18:00-00:00)
+
+input group "=== Entry Settings ==="
+input int      InpMaxConfirmBars = 6;      // Max bars after sweep to allow confirmation
+input bool     InpUseMarketEntry = true;   // Enable market entry on confirmation
+input bool     InpUseLimit618    = false;  // Enable 0.618 limit entry
+input bool     InpUseLimit705    = false;  // Enable 0.705 limit entry
+input bool     InpUseLimit786    = false;  // Enable 0.786 limit entry
+input bool     InpLimitRequireOB  = false; // Place limits only if an order block formed in the sweep leg
+input bool     InpLimitRequireFVG = false; // Place limits only if an FVG formed in the sweep leg
+
+input group "=== Market Close ==="
+input bool     InpCancelLimitsBeforeClose = false; // Delete pending limits before market close
+input int      InpMinutesBeforeClose      = 15;    // Minutes before close to delete limits
+
+input group "=== Break-Even ==="
+input bool     InpUseBreakEven   = false;  // Move SL to entry after reaching trigger R
+input double   InpBreakEvenAtR   = 1.0;    // R multiple that triggers break-even
+
+input group "=== Direction Filter ==="
+input bool     InpTradeShorts    = true;   // Allow Shorts (session-High sweep)
+input bool     InpTradeLongs     = true;   // Allow Longs  (session-Low sweep)
+input bool     InpUseDailyEMAFilter = false; // Longs only above / shorts only below the daily EMA
+input int      InpDailyEMAPeriod    = 50;    // Daily EMA period
+
+input group "=== EA Identity ==="
+input int      InpMagicNumber    = 705705; // Magic Number
+input int      InpMaxSlippage    = 30;     // Max slippage (points)
+
+//--- Global Objects
+CTrade         trade;
+CPositionInfo  posInfo;
+int            g_dailyEMAHandle = INVALID_HANDLE;
+
+//--- Session tracking
+int    g_currentSession   = 0;     // 1=Asian 2=London 3=NY 4=Fourth 0=none
+int    g_prevSession      = 0;
+
+double g_prevSessionHigh  = 0.0;   bool g_hasPrevHigh = false;
+double g_prevSessionLow   = 0.0;   bool g_hasPrevLow  = false;
+double g_currSessionHigh  = 0.0;   bool g_hasCurrHigh = false;
+double g_currSessionLow   = 0.0;   bool g_hasCurrLow  = false;
+
+bool   g_touchedBelowPSH  = false; // price traded at/below prev session high this session
+bool   g_touchedAbovePSL  = false; // price traded at/above prev session low this session
+
+//--- Bar counter (increments each closed bar) used for confirmation window
+long   g_barCounter       = 0;
+
+//--- Bearish (short) state machine: 0=scanning 1=swept 2=traded/done
+int    g_bState           = 0;
+double g_bSweepHigh       = 0.0;
+double g_bSweepLow        = 0.0;   // sweep candle's low (confirmation reference)
+long   g_bSweepBar        = 0;
+
+//--- Bullish (long) state machine: 0=scanning 1=swept 2=traded/done
+int    g_lState           = 0;
+double g_lSweepLow        = 0.0;
+double g_lSweepHigh       = 0.0;   // sweep candle's high (confirmation reference)
+long   g_lSweepBar        = 0;
+
+//--- One trade per direction per session
+bool   g_shortDoneSession = false;
+bool   g_longDoneSession  = false;
+
+//--- New-bar detection
+datetime g_lastBarTime    = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpMaxSlippage);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+   if(Period() != PERIOD_M15)
+      Print("WARNING: EA designed for M15. Current timeframe differs.");
+
+   if(InpUseDailyEMAFilter)
+   {
+      g_dailyEMAHandle = iMA(_Symbol, PERIOD_D1, InpDailyEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      if(g_dailyEMAHandle == INVALID_HANDLE)
+      {
+         Print("Failed to create daily EMA handle.");
+         return(INIT_FAILED);
+      }
+   }
+
+   Print("Quarterly Theory CRT EA initialized. Risk=", InpRiskPercent,
+         "% | Magic=", InpMagicNumber);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(g_dailyEMAHandle != INVALID_HANDLE)
+      IndicatorRelease(g_dailyEMAHandle);
+   Print("Quarterly Theory CRT EA removed. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Determine the 6-hour session index for a given broker time       |
+//+------------------------------------------------------------------+
+int GetSessionIndex(datetime brokerTime)
+{
+   datetime adjusted = brokerTime + (datetime)(InpSessionGMTOffset * 3600);
+   MqlDateTime dt;
+   TimeToStruct(adjusted, dt);
+   int h = dt.hour;
+   if(h < 6)  return 1; // Asian
+   if(h < 12) return 2; // London
+   if(h < 18) return 3; // New York
+   return 4;            // Fourth
+}
+
+//+------------------------------------------------------------------+
+//| True if new entries are allowed in the given session             |
+//+------------------------------------------------------------------+
+bool IsSessionEnabled(int session)
+{
+   switch(session)
+   {
+      case 1: return InpTradeAsian;
+      case 2: return InpTradeLondon;
+      case 3: return InpTradeNewYork;
+      case 4: return InpTradeFourth;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size for a given risk % and SL distance            |
+//+------------------------------------------------------------------+
+double CalcLotSize(double entryPrice, double slPrice)
+{
+   double slDistance = MathAbs(entryPrice - slPrice);
+   if(slDistance <= 0.0)
+      return 0.0;
+
+   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney = balance * InpRiskPercent / 100.0;
+
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickSize <= 0.0 || tickValue <= 0.0)
+      return 0.0;
+
+   double lossPerLot = (slDistance / tickSize) * tickValue;
+   if(lossPerLot <= 0.0)
+      return 0.0;
+
+   double lots = riskMoney / lossPerLot;
+
+   // Normalize to broker constraints
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(lotStep > 0.0)
+      lots = MathFloor(lots / lotStep) * lotStep;
+
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+
+   return NormalizeDouble(lots, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Check whether the EA already holds a position                    |
+//+------------------------------------------------------------------+
+bool HasOpenPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(posInfo.SelectByTicket(ticket))
+      {
+         if(posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
+            return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check whether the EA has any pending orders                      |
+//+------------------------------------------------------------------+
+bool HasPendingOrders()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Cancel all of the EA's pending orders                            |
+//+------------------------------------------------------------------+
+void CancelPendingOrders()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+         trade.OrderDelete(ticket);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| True if within InpMinutesBeforeClose of the trade session end    |
+//+------------------------------------------------------------------+
+bool IsNearMarketClose()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeTradeServer(), dt);
+   long secOfDay = dt.hour * 3600 + dt.min * 60 + dt.sec;
+   datetime from, to;
+
+   for(uint i = 0; SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)dt.day_of_week, i, from, to); i++)
+   {
+      if(secOfDay < (long)from || secOfDay >= (long)to) continue;
+
+      long closeAt = (long)to;
+      // A session ending at 24:00 that resumes at 00:00 the next day is not a real close
+      for(int d = 1; d < 7 && closeAt % 86400 == 0; d++)
+      {
+         datetime nf, nt;
+         if(!SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)((dt.day_of_week + d) % 7), 0, nf, nt) || nf != 0)
+            break;
+         closeAt = d * 86400L + (long)nt;
+      }
+      return closeAt - secOfDay <= InpMinutesBeforeClose * 60L;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Move SL to entry once price has moved InpBreakEvenAtR * risk     |
+//+------------------------------------------------------------------+
+void ManageBreakEven()
+{
+   double bid        = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask        = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl    = PositionGetDouble(POSITION_SL);
+      double tp    = PositionGetDouble(POSITION_TP);
+      if(sl == 0) continue;
+
+      double beSL  = NormalizeDouble(entry, _Digits);
+      bool   isBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+
+      if(isBuy)
+      {
+         if(sl >= beSL) continue; // already at or beyond entry
+         double risk = entry - sl;
+         if(bid - entry >= risk * InpBreakEvenAtR && bid - beSL > stopsLevel)
+            if(trade.PositionModify(ticket, beSL, tp))
+               Print("Break-even: BUY #", ticket, " SL moved to ", beSL);
+      }
+      else
+      {
+         if(sl <= beSL) continue;
+         double risk = sl - entry;
+         if(entry - ask >= risk * InpBreakEvenAtR && beSL - ask > stopsLevel)
+            if(trade.PositionModify(ticket, beSL, tp))
+               Print("Break-even: SELL #", ticket, " SL moved to ", beSL);
+      }
+   }
+}
+//+------------------------------------------------------------------+
+bool StopsAreValid(bool isBuy, double entry, double sl, double tp)
+{
+   long   stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist    = stopsLevel * _Point;
+
+   if(isBuy)
+   {
+      if(sl >= entry || tp <= entry) return false;
+      if(entry - sl < minDist)       return false;
+      if(tp - entry < minDist)       return false;
+   }
+   else
+   {
+      if(sl <= entry || tp >= entry) return false;
+      if(sl - entry < minDist)       return false;
+      if(entry - tp < minDist)       return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| TP price at InpTakeProfitRR * risk from the entry                |
+//+------------------------------------------------------------------+
+double CalcTakeProfit(bool isBuy, double entry, double sl)
+{
+   double risk = MathAbs(entry - sl);
+   return isBuy ? entry + risk * InpTakeProfitRR : entry - risk * InpTakeProfitRR;
+}
+
+//+------------------------------------------------------------------+
+//| Open a market trade sized to the risk %                          |
+//+------------------------------------------------------------------+
+void ExecuteTrade(bool isBuy, double slPrice)
+{
+   double entry = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                        : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   double sl = NormalizeDouble(slPrice, _Digits);
+   double tp = NormalizeDouble(CalcTakeProfit(isBuy, entry, sl), _Digits);
+
+   if(!StopsAreValid(isBuy, entry, sl, tp))
+   {
+      Print("Trade skipped: invalid stops. entry=", entry, " sl=", sl, " tp=", tp);
+      return;
+   }
+
+   double lots = CalcLotSize(entry, sl);
+   if(lots <= 0.0)
+   {
+      Print("Trade skipped: computed lot size is zero.");
+      return;
+   }
+
+   bool ok = isBuy ? trade.Buy(lots, _Symbol, entry, sl, tp, "QT CRT Long")
+                   : trade.Sell(lots, _Symbol, entry, sl, tp, "QT CRT Short");
+
+   if(ok)
+      Print((isBuy ? "BUY " : "SELL "), lots, " lots | risk=", InpRiskPercent,
+            "% | entry=", entry,
+            " SL=", sl, " TP=", tp);
+   else
+      Print("Order failed: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+}
+
+//+------------------------------------------------------------------+
+//| Place a limit order sized to the risk %                          |
+//+------------------------------------------------------------------+
+void PlaceLimitOrder(bool isBuy, double price, double slPrice, string tag)
+{
+   double px      = NormalizeDouble(price,   _Digits);
+   double sl      = NormalizeDouble(slPrice, _Digits);
+   double tp      = NormalizeDouble(CalcTakeProfit(isBuy, px, sl), _Digits);
+   double minDist = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(isBuy ? (px > ask - minDist) : (px < bid + minDist))
+   {
+      Print("Limit ", tag, " skipped: price ", px, " not beyond market.");
+      return;
+   }
+   if(!StopsAreValid(isBuy, px, sl, tp))
+   {
+      Print("Limit ", tag, " skipped: invalid stops. price=", px, " sl=", sl, " tp=", tp);
+      return;
+   }
+
+   double lots = CalcLotSize(px, sl);
+   if(lots <= 0.0)
+      return;
+
+   // Many brokers reject IOC filling on pending orders
+   trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   bool ok = isBuy ? trade.BuyLimit (lots, px, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "QT CRT Long "  + tag)
+                   : trade.SellLimit(lots, px, _Symbol, sl, tp, ORDER_TIME_GTC, 0, "QT CRT Short " + tag);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+   if(ok)
+      Print((isBuy ? "BUY LIMIT " : "SELL LIMIT "), tag, " ", lots, " lots @ ", px,
+            " | risk=", InpRiskPercent, "% SL=", sl, " TP=", tp);
+   else
+      Print("Limit ", tag, " failed: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
+}
+
+//+------------------------------------------------------------------+
+//| Order block between fromShift and the confirmation bar (shift 1) |
+//| Bullish: bearish candle, next candle closes above its high       |
+//| Bearish: bullish candle, next candle closes below its low        |
+//+------------------------------------------------------------------+
+bool HasOrderBlock(bool isBuy, int fromShift)
+{
+   for(int s = fromShift; s >= 2; s--)
+   {
+      double o  = iOpen (_Symbol, PERIOD_M15, s);
+      double c  = iClose(_Symbol, PERIOD_M15, s);
+      double nc = iClose(_Symbol, PERIOD_M15, s - 1);
+      if(isBuy ? (c < o && nc > iHigh(_Symbol, PERIOD_M15, s))
+               : (c > o && nc < iLow (_Symbol, PERIOD_M15, s)))
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| FVG between fromShift and the confirmation bar (shift 1)         |
+//| Bullish: low[3rd] > high[1st] | Bearish: high[3rd] < low[1st]    |
+//+------------------------------------------------------------------+
+bool HasFVG(bool isBuy, int fromShift)
+{
+   for(int s = fromShift; s >= 3; s--)
+   {
+      if(isBuy ? (iLow (_Symbol, PERIOD_M15, s - 2) > iHigh(_Symbol, PERIOD_M15, s))
+               : (iHigh(_Symbol, PERIOD_M15, s - 2) < iLow (_Symbol, PERIOD_M15, s)))
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Daily EMA bias from the last closed daily candle                 |
+//+------------------------------------------------------------------+
+bool DailyEMAAllows(bool isBuy)
+{
+   if(!InpUseDailyEMAFilter) return true;
+   double ema[1];
+   if(CopyBuffer(g_dailyEMAHandle, 0, 1, 1, ema) < 1) return false;
+   double close = iClose(_Symbol, PERIOD_D1, 1);
+   if(close == 0) return false;
+   return isBuy ? close > ema[0] : close < ema[0];
+}
+
+//+------------------------------------------------------------------+
+//| Place all enabled entries for a confirmed signal                 |
+//| fibAnchor = confirmation candle extreme, fibRange = distance to  |
+//| the current session extreme                                      |
+//+------------------------------------------------------------------+
+void ExecuteSignal(bool isBuy, double sl, double fibAnchor, double fibRange, int sweepShift)
+{
+   if(HasOpenPosition() || HasPendingOrders())
+      return; // only one setup active at a time
+
+   if(!DailyEMAAllows(isBuy))
+   {
+      Print((isBuy ? "Long" : "Short"), " signal skipped: against daily EMA ", InpDailyEMAPeriod, ".");
+      return;
+   }
+
+   if(InpUseMarketEntry)
+      ExecuteTrade(isBuy, sl);
+
+   if(!(InpUseLimit618 || InpUseLimit705 || InpUseLimit786))
+      return;
+
+   if(InpCancelLimitsBeforeClose && IsNearMarketClose())
+   {
+      Print("Limits skipped: market close is near.");
+      return;
+   }
+
+   // OB candle may be the bar just before the sweep candle
+   if(InpLimitRequireOB && !HasOrderBlock(isBuy, sweepShift + 1))
+   {
+      Print("Limits skipped: no order block in sweep leg.");
+      return;
+   }
+   if(InpLimitRequireFVG && !HasFVG(isBuy, sweepShift))
+   {
+      Print("Limits skipped: no FVG in sweep leg.");
+      return;
+   }
+
+   double dir = isBuy ? -1.0 : 1.0;
+   if(InpUseLimit618) PlaceLimitOrder(isBuy, fibAnchor + dir * 0.618 * fibRange, sl, "618");
+   if(InpUseLimit705) PlaceLimitOrder(isBuy, fibAnchor + dir * 0.705 * fibRange, sl, "705");
+   if(InpUseLimit786) PlaceLimitOrder(isBuy, fibAnchor + dir * 0.786 * fibRange, sl, "786");
+}
+
+//+------------------------------------------------------------------+
+//| Process a single completed bar                                   |
+//+------------------------------------------------------------------+
+void ProcessBar(datetime barTime, double barOpen, double barHigh,
+                double barLow, double barClose)
+{
+   g_barCounter++;
+
+   int session = GetSessionIndex(barTime);
+   bool isNewSession = (session != g_prevSession);
+
+   //--- Session roll-over: promote completed session to "previous"
+   if(isNewSession)
+   {
+      if(g_hasCurrHigh)
+      {
+         g_prevSessionHigh = g_currSessionHigh; g_hasPrevHigh = true;
+         g_prevSessionLow  = g_currSessionLow;  g_hasPrevLow  = true;
+      }
+
+      // reset current session extremes
+      g_currSessionHigh = barHigh; g_hasCurrHigh = true;
+      g_currSessionLow  = barLow;  g_hasCurrLow  = true;
+
+      g_touchedBelowPSH = g_hasPrevHigh && (barLow  <= g_prevSessionHigh);
+      g_touchedAbovePSL = g_hasPrevLow  && (barHigh >= g_prevSessionLow);
+
+      // reset direction state machines for the new session
+      CancelPendingOrders();
+      g_bState = 0;
+      g_lState = 0;
+      g_shortDoneSession = false;
+      g_longDoneSession  = false;
+   }
+   else
+   {
+      if(g_hasCurrHigh) g_currSessionHigh = MathMax(g_currSessionHigh, barHigh);
+      if(g_hasCurrLow)  g_currSessionLow  = MathMin(g_currSessionLow,  barLow);
+
+      if(g_hasPrevHigh && barLow  <= g_prevSessionHigh) g_touchedBelowPSH = true;
+      if(g_hasPrevLow  && barHigh >= g_prevSessionLow)  g_touchedAbovePSL = true;
+   }
+
+   g_prevSession = session;
+
+   // Session levels are still tracked above so the next enabled session has a valid reference
+   if(!IsSessionEnabled(session))
+      return;
+
+   //================================================================
+   // BEARISH CRT (Short)
+   //================================================================
+   if(InpTradeShorts && !g_shortDoneSession)
+   {
+      // 1. Detect sweep of previous session high
+      if(g_bState == 0 && g_hasPrevHigh && barHigh > g_prevSessionHigh && g_touchedBelowPSH)
+      {
+         g_bSweepHigh = barHigh;
+         g_bSweepLow  = barLow;   // sweep candle low = confirmation reference
+         g_bSweepBar  = g_barCounter;
+         g_bState     = 1;
+      }
+      // 2. Await confirmation close below sweep candle low
+      else if(g_bState == 1 && g_barCounter > g_bSweepBar)
+      {
+         if(barClose < g_bSweepLow)
+         {
+            double sl = g_currSessionHigh + InpSLBufferPoints * _Point;
+
+            if(sl > barClose)
+            {
+               ExecuteSignal(false, sl, barLow, g_currSessionHigh - barLow,
+                             1 + (int)(g_barCounter - g_bSweepBar));
+               g_bState = 2;
+               g_shortDoneSession = true;
+            }
+            else
+            {
+               g_bState = 0; // invalid geometry, keep scanning
+            }
+         }
+         else if(barHigh > g_prevSessionHigh)
+         {
+            // Re-sweep: extend the swing high and reset the confirmation window
+            if(barHigh > g_bSweepHigh) g_bSweepHigh = barHigh;
+            g_bSweepBar = g_barCounter;
+         }
+         else if(g_barCounter - g_bSweepBar >= InpMaxConfirmBars)
+         {
+            g_bState = 0; // confirmation window expired
+         }
+      }
+   }
+
+   //================================================================
+   // BULLISH CRT (Long)
+   //================================================================
+   if(InpTradeLongs && !g_longDoneSession)
+   {
+      // 1. Detect sweep of previous session low
+      if(g_lState == 0 && g_hasPrevLow && barLow < g_prevSessionLow && g_touchedAbovePSL)
+      {
+         g_lSweepLow  = barLow;
+         g_lSweepHigh = barHigh;  // sweep candle high = confirmation reference
+         g_lSweepBar  = g_barCounter;
+         g_lState     = 1;
+      }
+      // 2. Await confirmation close above sweep candle high
+      else if(g_lState == 1 && g_barCounter > g_lSweepBar)
+      {
+         if(barClose > g_lSweepHigh)
+         {
+            double sl = g_currSessionLow - InpSLBufferPoints * _Point;
+
+            if(sl < barClose)
+            {
+               ExecuteSignal(true, sl, barHigh, barHigh - g_currSessionLow,
+                             1 + (int)(g_barCounter - g_lSweepBar));
+               g_lState = 2;
+               g_longDoneSession = true;
+            }
+            else
+            {
+               g_lState = 0; // invalid geometry, keep scanning
+            }
+         }
+         else if(barLow < g_prevSessionLow)
+         {
+            // Re-sweep: extend the swing low and reset the confirmation window
+            if(barLow < g_lSweepLow) g_lSweepLow = barLow;
+            g_lSweepBar = g_barCounter;
+         }
+         else if(g_barCounter - g_lSweepBar >= InpMaxConfirmBars)
+         {
+            g_lState = 0; // confirmation window expired
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(InpUseBreakEven)
+      ManageBreakEven();
+
+   if(InpCancelLimitsBeforeClose && IsNearMarketClose())
+      CancelPendingOrders();
+
+   // Act only on a newly closed bar
+   datetime currentBarTime = iTime(_Symbol, PERIOD_M15, 0);
+   if(currentBarTime == g_lastBarTime)
+      return;
+   g_lastBarTime = currentBarTime;
+
+   // Read the just-closed bar (shift 1)
+   double barOpen  = iOpen(_Symbol,  PERIOD_M15, 1);
+   double barHigh  = iHigh(_Symbol,  PERIOD_M15, 1);
+   double barLow   = iLow(_Symbol,   PERIOD_M15, 1);
+   double barClose = iClose(_Symbol, PERIOD_M15, 1);
+   datetime barTime = iTime(_Symbol, PERIOD_M15, 1);
+
+   if(barTime == 0)
+      return; // history not ready
+
+   ProcessBar(barTime, barOpen, barHigh, barLow, barClose);
+}
+//+------------------------------------------------------------------+
