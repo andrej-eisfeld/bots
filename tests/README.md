@@ -29,6 +29,9 @@ The goal is to find parameters that work on data they were **not** optimized on.
   - **AsiaRangeBreakout:** `AsiaEndHour`, `CancelHour`, `TP_RR`, `UseEMAFilter`, `UseBreakEven`
   - **CRT:** `MaxConfirmBars`, `SlBufferPoints`, entry toggles, `TP_R_*`, `UseBreakEven`
   - **QT:** `InpTakeProfitRR`, `InpSLBufferPoints`, `InpMaxConfirmBars`, session toggles, market vs. limit entries
+  - **DailyKeyZones:** `InpZoneMode`, `InpZoneLookback`, `InpSLMode`, `InpRiskReward`, `InpUseVolumeFilter`
+  - **TDM:** `InpUseDailyEMAFilter`, `InpDailyEMAPeriod`, `InpTPAtEntryOnNew`, chart timeframe
+  - **TT:** `InpEntryS1` / `InpExitS1`, `InpEntryS2` / `InpExitS2`, `InpStopN`, `InpUseS1Filter`, `InpUsePyramiding`
 - Never optimize magic number, slippage or risk %.
 - Criterion: Profit Factor, Recovery Factor, Sharpe Ratio or Complex Criterion – **not** Balance max (compounding inflates it).
 - Ignore passes with too few trades.
