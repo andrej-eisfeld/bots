@@ -7,6 +7,9 @@ MetaTrader 5 Expert Advisors (EAs).
 | [AsiaRangeBreakout.mq5](AsiaRangeBreakout.mq5) | Asia Range Breakout | Any (uses M1 data for the range) | Stop orders at the Asia session high/low |
 | [CRT.mq5](CRT.mq5) | CRT OTE | M15 / H1 / H4 | Candle Range Theory sweep of the higher-timeframe candle + OTE limit entries |
 | [QT.mt5](QT.mt5) | Quarterly Theory CRT | M15 | CRT sweep of the previous 6-hour session high/low |
+| [DailyKeyZones.mq5](DailyKeyZones.mq5) | Daily EMA Zone Engulfing | Any lower TF (zones from D1) | Engulfing candle inside a daily order block / FVG, in the direction of the daily EMA |
+| [TDM.mq5](TDM.mq5) | TD Sequential (XAUUSD) | Any | Entry on a completed TD Sequential buy or sell setup |
+| [TT.mq5](TT.mq5) | Turtle Trader | D1 (original rules) | Donchian channel breakout, Turtle System 1 + 2 with N-based sizing |
 
 Folders:
 
@@ -139,3 +142,107 @@ The day is split into four 6-hour sessions (in the target timezone, see `InpSess
 | Direction Filter | `InpTradeShorts`, `InpTradeLongs` | Enable directions |
 | | `InpUseDailyEMAFilter` / `InpDailyEMAPeriod` | Longs only above / shorts only below the daily EMA |
 | EA Identity | `InpMagicNumber`, `InpMaxSlippage` | EA identity / execution |
+
+---
+
+## Daily EMA Zone Engulfing
+
+[DailyKeyZones.mq5](DailyKeyZones.mq5)
+
+**Logic** (evaluated once per new bar of the signal timeframe)
+
+1. **Trend:** the signal candle closes above (long) / below (short) the `InpEMAPeriod` EMA of the higher timeframe `InpHTF`.
+2. **Zone:** the two-candle pattern overlaps a higher-timeframe zone scanned over the last `InpZoneLookback` completed HTF bars:
+   - Bullish order block: bearish candle followed by a candle closing above its high (bearish OB mirrored).
+   - Bullish FVG: gap between the high of candle 1 and the low of candle 3 (bearish FVG mirrored).
+   - Optionally, zones already broken by an HTF close are ignored.
+3. **Trigger:** engulfing candle on the signal timeframe, optionally with tick volume above the average of the previous `InpVolumePeriod` bars.
+4. Market entry. SL beyond the engulfed candle (or both candles), an ATR distance, or candle + ATR buffer. TP at `InpRiskReward` × risk.
+5. Optional break-even with lock-in offset; optionally only one open position at a time.
+
+**Inputs**
+
+| Group | Input | Description |
+|---|---|---|
+| Trend filter | `InpHTF` | Higher timeframe for EMA and zones |
+| | `InpEMAPeriod` | EMA period |
+| Daily zones | `InpZoneMode` | Order blocks and FVGs / OB only / FVG only |
+| | `InpZoneLookback` | HTF bars to scan for zones |
+| | `InpRemoveMitigated` | Ignore zones broken by an HTF close |
+| Entry | `InpSignalTF` | Engulfing (signal) timeframe |
+| | `InpEnableBuy`, `InpEnableSell` | Enable directions |
+| | `InpOnePosition` | Only one open position at a time |
+| Volume filter | `InpUseVolumeFilter` / `InpVolumePeriod` | Require above-average tick volume on the engulfing candle |
+| Stop loss / Take profit | `InpSLMode` | Beyond engulfed candle / ATR distance / candle + ATR buffer |
+| | `InpSLUsePattern` | Use the extreme of both candles instead of only the engulfed one |
+| | `InpSLBufferPips` | Extra buffer beyond the candle (pips) |
+| | `InpATRPeriod` / `InpATRMult` | ATR settings (signal timeframe) |
+| | `InpRiskReward` | TP as R multiple |
+| Breakeven | `InpUseBreakeven`, `InpBETriggerRR`, `InpBEOffsetPips` | Move SL to entry + offset after trigger R |
+| Money management | `InpLotMode` | Fixed lots / risk % of balance |
+| | `InpLots`, `InpRiskPercent` | Fixed lot size / risk per trade |
+| | `InpMagic` | Magic number |
+
+---
+
+## TD Sequential (XAUUSD)
+
+[TDM.mq5](TDM.mq5) – designed for XAUUSD.
+
+**Logic** (evaluated once per closed bar of the chart timeframe)
+
+1. **Setup:** a TD Sequential setup completes on the last closed bar – exactly 9 consecutive bars with `close < close[4]` (buy) or `close > close[4]` (sell). A 10th bar would mean the setup already fired earlier.
+2. Optional filter: buy only if the last daily close is above the daily EMA, sell only if below.
+3. Market order. Buy: TP at the high of the current month; sell: TP at the low of the current month (`PERIOD_MN1`, shift 0). SL at the same distance on the other side of the entry (1:1). Lot size risks `InpRiskPercent` of balance.
+4. Optional risk reduction: when a new position opens, other positions of this EA that are in drawdown get their TP moved to their entry price.
+
+Multiple positions can be open at the same time – every completed setup opens a new trade.
+
+**Inputs**
+
+| Group | Input | Description |
+|---|---|---|
+| Trade Settings | `InpRiskPercent` | Risk per trade in % of balance |
+| | `InpTradeLongs`, `InpTradeShorts` | Trade buy / sell setups |
+| Daily EMA Filter | `InpUseDailyEMAFilter` / `InpDailyEMAPeriod` | Buy only above / sell only below the daily EMA (last daily close) |
+| Risk Reduction | `InpTPAtEntryOnNew` | On a new position, move the TP of other losing positions to entry |
+| EA Identity | `InpMagicNumber` | Magic number |
+
+---
+
+## Turtle Trader
+
+[TT.mq5](TT.mq5) – based on the original Turtle rules and the "Turtle Trade Channels Indicator" (TuTCI).
+
+**Logic** (evaluated once per closed bar of the working timeframe, only while the symbol's session is open)
+
+| System | Entry | Exit |
+|---|---|---|
+| S1 (fast) | 20-bar breakout | 10-bar opposite breakout |
+| S2 (fail-safe) | 55-bar breakout | 20-bar opposite breakout |
+
+1. **Entry:** when flat, go long on a break above the highest high (short below the lowest low) of the previous entry-period bars. S2 is preferred if both trigger.
+2. **S1 filter:** an S1 breakout is only taken if the previous S1 signal would have been a loss. This is tracked with a simulated ("phantom") S1 trade, so it works whether or not the signal was actually traded. S2 breakouts are always taken.
+3. **Exit:** close on a break of the opposite exit channel (S1 or S2 length, taken from the position comment).
+4. **Stops:** N = ATR. Optional hard stop at `InpStopN` × N from the entry.
+5. **Sizing:** one Unit risks `InpRiskPerN_Percent` of equity per 1N move (or a fixed lot), capped at `InpMaxLot`.
+6. **Pyramiding (optional):** add a Unit every `InpAddStepN` × N in favour, up to `InpMaxUnits`, and trail all stops to `InpStopN` × N from the last close.
+7. Exits are always managed. New entries and pyramiding can be blocked on Mondays and Fridays (both blocked by default) and when the spread is too high.
+
+**Inputs**
+
+| Group | Input | Description |
+|---|---|---|
+| General | `InpTimeframe` | Working timeframe (Turtles used D1) |
+| System 1 | `InpUseS1`, `InpEntryS1`, `InpExitS1` | Enable S1, entry / exit channel lengths |
+| | `InpUseS1Filter` | Skip S1 entries if the last S1 signal was a win |
+| System 2 | `InpUseS2`, `InpEntryS2`, `InpExitS2` | Enable S2, entry / exit channel lengths |
+| Volatility / Stops | `InpATRPeriod` | ATR period (N) |
+| | `InpStopN` | Initial stop distance in N |
+| | `InpUseHardStop` | Attach the stop-loss to the order |
+| Position Sizing | `InpUseRiskSizing`, `InpRiskPerN_Percent` | Volatility sizing: % of equity per 1N |
+| | `InpFixedLot`, `InpMaxLot` | Fixed lot (sizing off) and hard lot cap |
+| Pyramiding | `InpUsePyramiding`, `InpMaxUnits`, `InpAddStepN` | Add Units in favour of the trade |
+| Trade Control | `InpMagic`, `InpSlippagePoints`, `InpTradeComment` | EA identity / execution |
+| | `InpMaxSpreadPoints` | Max spread for entries (0 = ignore) |
+| | `InpTradeMonday`, `InpTradeFriday` | Allow new entries on Monday / Friday (server time) |

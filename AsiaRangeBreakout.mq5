@@ -57,7 +57,7 @@ double StopsDistance()
 
 bool IsOwn(string symbol, long magic) { return symbol == _Symbol && magic == MagicNumber; }
 
-//--- Lot size so that hitting the SL loses RiskPercent of balance; 0 if below min lot
+//--- Lot size so that hitting the SL loses RiskPercent of balance; clamped to [min lot, max lot]
 double CalcLots(double slDistance)
 {
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
@@ -73,8 +73,8 @@ double CalcLots(double slDistance)
 
    if(lots < minLot)
    {
-      PrintFormat("Lot size %.4f below minimum %.2f for risk %.2f%% – order skipped.", lots, minLot, RiskPercent);
-      return 0;
+      PrintFormat("Lot size %.4f below minimum %.2f for risk %.2f%% – using minimum lot.", lots, minLot, RiskPercent);
+      lots = minLot;
    }
    return MathMin(lots, maxLot);
 }
